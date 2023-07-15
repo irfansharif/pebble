@@ -670,8 +670,10 @@ type candidateLevelInfo struct {
 	origScore float64
 	// The raw score of the level to be compacted, calculated using
 	// uncompensated file sizes and without any adjustments.
-	rawScore float64
-	level    int
+	rawScore             float64
+	compensatedLevelSize int64
+	actualLevelSize      int64
+	level                int
 	// The level to compact to.
 	outputLevel int
 	// The file in level that will be compacted. Additional files may be
@@ -1004,15 +1006,16 @@ func (p *compactionPickerByScore) calculateScores(
 
 	sizeAdjust := calculateSizeAdjust(inProgressCompactions)
 	for level := 1; level < numLevels; level++ {
-		compensatedLevelSize := int64(levelCompensatedSize(p.vers.Levels[level])) + sizeAdjust[level].compensated()
-		scores[level].score = float64(compensatedLevelSize) / float64(p.levelMaxBytes[level])
-		scores[level].origScore = scores[level].score
+		scores[level].compensatedLevelSize = int64(levelCompensatedSize(p.vers.Levels[level])) + sizeAdjust[level].compensated()
+		scores[level].origScore = float64(scores[level].compensatedLevelSize) / float64(p.levelMaxBytes[level])
+		scores[level].score = scores[level].origScore
 
 		// In addition to the compensated score, we calculate a separate score
 		// that uses actual file sizes, not compensated sizes. This is used
 		// during score smoothing down below to prevent excessive
 		// prioritization of reclaiming disk space.
-		scores[level].rawScore = float64(p.levelSizes[level]+sizeAdjust[level].actual()) / float64(p.levelMaxBytes[level])
+		scores[level].actualLevelSize = p.levelSizes[level] + sizeAdjust[level].actual()
+		scores[level].rawScore = float64(scores[level].actualLevelSize) / float64(p.levelMaxBytes[level])
 	}
 
 	// Adjust each level's score by the score of the next level. If the next
@@ -1039,14 +1042,53 @@ func (p *compactionPickerByScore) calculateScores(
 	var prevLevel int
 	for level := p.baseLevel; level < numLevels; level++ {
 		if scores[prevLevel].score >= 1 {
-			// Avoid absurdly large scores by placing a floor on the score that we'll
-			// adjust a level by. The value of 0.01 was chosen somewhat arbitrarily
+			// Avoid absurdly large scores by placing a floor on the score that
+			// we'll adjust a level by. The value of 0.01 was chosen somewhat
+			// arbitrarily.
 			const minScore = 0.01
-			if scores[level].rawScore >= minScore {
-				scores[prevLevel].score /= scores[level].rawScore
+			var divisor float64
+
+			// - We order by compensated-ratio for everything other than
+			//   L0=>Lbase compactions, and order by baseline-ratio for L0->Lbase
+			//   compactions. Using compensated ratio for lower level
+			//   compactions helps reduce space and write amplification whereas
+			//   the baseline-ratio helps prioritize L0 compactions over
+			//   lower-level compactions when lower-level scores are only higher
+			//   due to compensation.
+			// - Since Lbase=>Lbase+1 uses compensated ratios but L0=>Lbase
+			//   doesn't, the former may get de-prioritized relative to the
+			//   latter. It may grow to be larger compared to if we were using
+			//   compensated ratios all throughput. Since this scheme wants to
+			//   prioritize L0 compactions in the presence of high compensation
+			//   scores, if we simply used Lbase size when computing score
+			//   ratios, we may again de-prioritize L0 compactions. To adjust
+			//   for it, we subtract the compensation amount from Lbase's size
+			//   when calculating the score ratio.
+			if prevLevel == 0 {
+				// Denominator is level's size minus compensated amount (see
+				// above).
+				divisor = float64(scores[level].actualLevelSize-
+					(scores[level].compensatedLevelSize-scores[level].actualLevelSize)) / float64(p.levelMaxBytes[level])
 			} else {
-				scores[prevLevel].score /= minScore
+				// Numerator is the compensated size, denominator uncompensated.
+				// This choice was made because:
+				// A. We were observing too much reduction in the
+				//    compensated-score-ratio for L0, so by choosing a
+				//    denominator that was smaller (baseline-score(Lbase) <=
+				//    compensated-score(Lbase)), we don't reduce L0 score by as
+				//    much.
+				// B. The ratio logic is trying to compensate for the next level
+				//    being large, resulting in higher write-amp, so we can
+				//    justify use the actual size of that level.
+				//
+				// TODO(irfansharif): Reason A is no longer applicable, since we
+				// compute L0 score ratios differently.
+				divisor = scores[level].rawScore
 			}
+			if divisor < minScore {
+				divisor = minScore
+			}
+			scores[prevLevel].score /= divisor
 		}
 		prevLevel = level
 	}
