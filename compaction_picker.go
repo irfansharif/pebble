@@ -1049,9 +1049,9 @@ func (p *compactionPickerByScore) calculateScores(
 	//   L6        0.6        0.6       14 G       24 G
 
 	// Avoid absurdly large scores by placing a floor on the score that
-	// we'll adjust a level by. The value of 0.1 was chosen somewhat
-	// arbitrarily.
-	const minScore = 0.1
+	// we'll adjust a level by. The value of 0.2 was chosen somewhat
+	// arbitrarily, to maximally increase compensation scores by 5x.
+	const minScore = 0.2
 
 	var prevLevel int
 	for level := p.baseLevel; level < numLevels; level++ {
@@ -1072,33 +1072,43 @@ func (p *compactionPickerByScore) calculateScores(
 			//   ratios, we may again de-prioritize L0 compactions. To adjust
 			//   for it, we subtract the compensation amount from Lbase's size
 			//   when calculating the score ratio.
-			//
-			// TODO(irfansharif): The latter step can be quite unstable. If
-			// Lbase compensated size > 2*actual size, our L0 score is divided
-			// by the minScore, and we strictly prioritize lots of L0
-			// compactions into Lbase. Once it's <2x, we'll start continuously
-			// prioritizing Lbase=>Lbase+1 compactions. By now Lbase is quite
-			// large, so from the baseline-ratio perspective, it starts making
-			// sense. This can continue trickling down from Lbase+n=>Lbase+n+1,
-			// starving out L0 compactions.
 
-			// Numerator is the compensated size, denominator uncompensated.
-			// This choice was made because:
-			// A. We were observing too much reduction in the
-			//    compensated-score-ratio for L0, so by choosing a
-			//    denominator that was smaller (baseline-score(Lbase) <=
-			//    compensated-score(Lbase)), we don't reduce L0 score by as
-			//    much.
-			// B. The ratio logic is trying to compensate for the next level
-			//    being large, resulting in higher write-amp, so we can
-			//    justify use the actual size of that level.
-			//
-			// TODO(irfansharif): If two consecutive levels have high
-			// compensated scores (lots of tombstones present) relative to
-			// the database size (clearrange roachtest exemplifies this),
-			// the division results in a high compensated score ratio and we
-			// end up prioritizing such compactions over L0.
-			divisor := scores[level].rawScore
+			var divisor float64
+			if prevLevel == 0 {
+				// Denominator is level's size minus compensated amount (see
+				// above).
+				//
+				// TODO(irfansharif): This step can be quite unstable. If Lbase
+				// compensated size > 2*actual size, our L0 score is divided by
+				// the minScore, and we strictly prioritize lots of L0
+				// compactions into Lbase. Once it's <2x, we'll start
+				// continuously prioritizing Lbase=>Lbase+1 compactions. By now
+				// Lbase is quite large, so from the baseline-ratio perspective,
+				// it starts getting prioritized. This can continue trickling
+				// down from Lbase+n=>Lbase+n+1, starving out L0 compactions.
+				// For now we've reduced the minScore to reduce the multiplier
+				// when hitting the regime.
+				divisor = float64(scores[level].actualLevelSize-
+					(scores[level].compensatedLevelSize-scores[level].actualLevelSize)) / float64(p.levelMaxBytes[level])
+			} else {
+				// Numerator is the compensated size, denominator uncompensated.
+				// This choice was made because:
+				// A. We were observing too much reduction in the
+				//    compensated-score-ratio for L0, so by choosing a
+				//    denominator that was smaller (baseline-score(Lbase) <=
+				//    compensated-score(Lbase)), we don't reduce L0 score by as
+				//    much.
+				// B. The ratio logic is trying to compensate for the next level
+				//    being large, resulting in higher write-amp, so we can
+				//    justify use the actual size of that level.
+				//
+				// TODO(irfansharif): If two consecutive levels have high
+				// compensated scores (lots of tombstones present) relative to
+				// the database size (clearrange roachtest exemplifies this),
+				// the division results in a high compensated score ratio and we
+				// end up prioritizing such compactions over L0.
+				divisor = scores[level].rawScore
+			}
 			if divisor < minScore {
 				divisor = minScore
 			}
