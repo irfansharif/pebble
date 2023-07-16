@@ -87,6 +87,13 @@ func (s sortCompactionLevelsDecreasingScore) Len() int {
 	return len(s)
 }
 func (s sortCompactionLevelsDecreasingScore) Less(i, j int) bool {
+	if s[i].level == 0 || s[j].level == 0 {
+		// One of the levels is L0 -- use the baselineScoreRatio.
+		if s[i].baselineScoreRatio != s[j].baselineScoreRatio {
+			return s[i].baselineScoreRatio > s[j].baselineScoreRatio
+		}
+		return s[i].level < s[j].level
+	}
 	if s[i].score != s[j].score {
 		return s[i].score > s[j].score
 	}
@@ -664,7 +671,8 @@ func newCompactionPicker(
 type candidateLevelInfo struct {
 	// The score of the level to be compacted, with compensated file sizes and
 	// adjustments.
-	score float64
+	score              float64
+	baselineScoreRatio float64
 	// The original score of the level to be compacted, before adjusting
 	// according to other levels' sizes.
 	origScore float64
@@ -1039,18 +1047,19 @@ func (p *compactionPickerByScore) calculateScores(
 	//   L4        3.4        6.7      3.1 G      467 M
 	//   L5        3.4        2.0      6.6 G      3.3 G
 	//   L6        0.6        0.6       14 G       24 G
+
+	// Avoid absurdly large scores by placing a floor on the score that
+	// we'll adjust a level by. The value of 0.01 was chosen somewhat
+	// arbitrarily.
+	const minScore = 0.01
+
 	var prevLevel int
 	for level := p.baseLevel; level < numLevels; level++ {
 		if scores[prevLevel].score >= 1 {
-			// Avoid absurdly large scores by placing a floor on the score that
-			// we'll adjust a level by. The value of 0.01 was chosen somewhat
-			// arbitrarily.
-			const minScore = 0.01
 			var divisor float64
-
 			// - We order by compensated-ratio for everything other than
-			//   L0=>Lbase compactions, and order by baseline-ratio for L0->Lbase
-			//   compactions. Using compensated ratio for lower level
+			//   L0=>Lbase compactions, and order by baseline-ratio for
+			//   L0->Lbase compactions. Using compensated ratio for lower level
 			//   compactions helps reduce space and write amplification whereas
 			//   the baseline-ratio helps prioritize L0 compactions over
 			//   lower-level compactions when lower-level scores are only higher
@@ -1083,6 +1092,12 @@ func (p *compactionPickerByScore) calculateScores(
 				//
 				// TODO(irfansharif): Reason A is no longer applicable, since we
 				// compute L0 score ratios differently.
+				//
+				// TODO(irfansharif): If two consecutive levels have high
+				// compensated scores (lots of tombstones present) relative to
+				// the database size (clearrange roachtest exemplifies this),
+				// the division results in a high compensated score ratio and we
+				// end up prioritizing such compactions over L0.
 				divisor = scores[level].rawScore
 			}
 			if divisor < minScore {
@@ -1093,7 +1108,36 @@ func (p *compactionPickerByScore) calculateScores(
 		prevLevel = level
 	}
 
+	prevLevel = 0
+	for level := p.baseLevel; level < numLevels; level++ { // compute baselineScoreRatios
+		if prevLevel == 0 {
+			// Numerator is already uncompensated, copy it over.
+			scores[prevLevel].baselineScoreRatio = scores[prevLevel].score
+		} else {
+			divisor := scores[level].rawScore
+			if divisor < minScore {
+				divisor = minScore
+			}
+			// Numerator here is uncompensated size.
+			scores[prevLevel].baselineScoreRatio = scores[prevLevel].rawScore / divisor
+		}
+		prevLevel = level
+	}
 	sort.Sort(sortCompactionLevelsDecreasingScore(scores[:]))
+	for i := range scores {
+		// We've placed L0 in the score list according to its baseline ratio
+		// (and then level). Ensure the score values themselves are in
+		// descending order.
+		if scores[i].level != 0 {
+			continue
+		}
+		if i == len(scores)-1 {
+			continue
+		}
+		if scores[i].score < scores[i+1].score {
+			scores[i].score = scores[i+1].score
+		}
+	}
 	return scores
 }
 
