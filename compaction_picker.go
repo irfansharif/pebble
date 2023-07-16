@@ -89,15 +89,15 @@ func (s sortCompactionLevelsDecreasingScore) Len() int {
 func (s sortCompactionLevelsDecreasingScore) Less(i, j int) bool {
 	if s[i].level == 0 || s[j].level == 0 {
 		// One of the levels is L0. If its score > 1, have it strictly take
-		// precedence. If not, sort lower.
+		// precedence. If not, sort by score.
 		if s[i].level == 0 {
 			if s[i].score > 1 {
 				return true
 			}
-			return s[i].score > s[j].score
-		}
-		if s[j].score > 1 {
-			return false
+		} else {
+			if s[j].score > 1 {
+				return false
+			}
 		}
 		return s[i].score > s[j].score
 	}
@@ -1062,7 +1062,7 @@ func (p *compactionPickerByScore) calculateScores(
 
 	var prevLevel int
 	for level := p.baseLevel; level < numLevels; level++ {
-		if scores[prevLevel].score >= 1 && prevLevel != 0 {
+		if scores[prevLevel].score >= 1 {
 			// - (outdated) We order by compensated-ratio for everything other
 			//   than L0=>Lbase compactions, and order by baseline-ratio for
 			//   L0->Lbase compactions. Using compensated ratio for lower level
@@ -1120,17 +1120,13 @@ func (p *compactionPickerByScore) calculateScores(
 
 	prevLevel = 0
 	for level := p.baseLevel; level < numLevels; level++ { // compute baselineScoreRatios
-		if prevLevel == 0 {
-			// Numerator is already uncompensated, copy it over.
-			scores[prevLevel].baselineScoreRatio = scores[prevLevel].score
-		} else {
-			divisor := scores[level].rawScore
-			if divisor < minScore {
-				divisor = minScore
-			}
-			// Numerator here needs to be the uncompensated size.
-			scores[prevLevel].baselineScoreRatio = scores[prevLevel].rawScore / divisor
+		divisor := scores[level].rawScore
+		if divisor < minScore {
+			divisor = minScore
 		}
+
+		// Numerator here needs to be the uncompensated size.
+		scores[prevLevel].baselineScoreRatio = scores[prevLevel].rawScore / divisor
 		prevLevel = level
 	}
 	sort.Sort(sortCompactionLevelsDecreasingScore(scores[:]))
@@ -1145,7 +1141,7 @@ func (p *compactionPickerByScore) calculateScores(
 			continue
 		}
 		if scores[i].score < scores[i+1].score {
-			scores[i].score = scores[i+1].score
+			scores[i].score = scores[i+1].score + 0.1 // 0.1 delta just to identify in logging
 		}
 	}
 	return scores
@@ -1183,6 +1179,8 @@ func (p *compactionPickerByScore) calculateL0Score(
 	if info.score < fileScore {
 		info.score = fileScore
 	}
+	info.rawScore = info.score
+	info.origScore = info.score // TODO(irfansharif): uncompensated, unlike for other levels; not that it's used
 	return info
 }
 
@@ -1353,8 +1351,8 @@ func (p *compactionPickerByScore) pickAuto(env compactionEnv) (pc *pickedCompact
 			if pc.startLevel.level == info.level {
 				marker = "*"
 			}
-			fmt.Fprintf(&buf, "  %sL%d: %5.1f  %5.1f  %5.1f %8s  %8s",
-				marker, info.level, info.score, info.origScore, info.rawScore,
+			fmt.Fprintf(&buf, "  %sL%d: %5.1f  %5.1f  %5.1f %5.1f %8s  %8s",
+				marker, info.level, info.score, info.origScore, info.rawScore, info.baselineScoreRatio,
 				humanize.Int64(int64(totalCompensatedSize(
 					p.vers.Levels[info.level].Iter(),
 				))),
