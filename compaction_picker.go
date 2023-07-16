@@ -1049,9 +1049,9 @@ func (p *compactionPickerByScore) calculateScores(
 	//   L6        0.6        0.6       14 G       24 G
 
 	// Avoid absurdly large scores by placing a floor on the score that
-	// we'll adjust a level by. The value of 0.01 was chosen somewhat
+	// we'll adjust a level by. The value of 0.1 was chosen somewhat
 	// arbitrarily.
-	const minScore = 0.01
+	const minScore = 0.1
 
 	var prevLevel int
 	for level := p.baseLevel; level < numLevels; level++ {
