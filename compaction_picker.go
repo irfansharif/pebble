@@ -1056,7 +1056,6 @@ func (p *compactionPickerByScore) calculateScores(
 	var prevLevel int
 	for level := p.baseLevel; level < numLevels; level++ {
 		if scores[prevLevel].score >= 1 {
-			var divisor float64
 			// - We order by compensated-ratio for everything other than
 			//   L0=>Lbase compactions, and order by baseline-ratio for
 			//   L0->Lbase compactions. Using compensated ratio for lower level
@@ -1073,33 +1072,33 @@ func (p *compactionPickerByScore) calculateScores(
 			//   ratios, we may again de-prioritize L0 compactions. To adjust
 			//   for it, we subtract the compensation amount from Lbase's size
 			//   when calculating the score ratio.
-			if prevLevel == 0 {
-				// Denominator is level's size minus compensated amount (see
-				// above).
-				divisor = float64(scores[level].actualLevelSize-
-					(scores[level].compensatedLevelSize-scores[level].actualLevelSize)) / float64(p.levelMaxBytes[level])
-			} else {
-				// Numerator is the compensated size, denominator uncompensated.
-				// This choice was made because:
-				// A. We were observing too much reduction in the
-				//    compensated-score-ratio for L0, so by choosing a
-				//    denominator that was smaller (baseline-score(Lbase) <=
-				//    compensated-score(Lbase)), we don't reduce L0 score by as
-				//    much.
-				// B. The ratio logic is trying to compensate for the next level
-				//    being large, resulting in higher write-amp, so we can
-				//    justify use the actual size of that level.
-				//
-				// TODO(irfansharif): Reason A is no longer applicable, since we
-				// compute L0 score ratios differently.
-				//
-				// TODO(irfansharif): If two consecutive levels have high
-				// compensated scores (lots of tombstones present) relative to
-				// the database size (clearrange roachtest exemplifies this),
-				// the division results in a high compensated score ratio and we
-				// end up prioritizing such compactions over L0.
-				divisor = scores[level].rawScore
-			}
+			//
+			// TODO(irfansharif): The latter step can be quite unstable. If
+			// Lbase compensated size > 2*actual size, our L0 score is divided
+			// by the minScore, and we strictly prioritize lots of L0
+			// compactions into Lbase. Once it's <2x, we'll start continuously
+			// prioritizing Lbase=>Lbase+1 compactions. By now Lbase is quite
+			// large, so from the baseline-ratio perspective, it starts making
+			// sense. This can continue trickling down from Lbase+n=>Lbase+n+1,
+			// starving out L0 compactions.
+
+			// Numerator is the compensated size, denominator uncompensated.
+			// This choice was made because:
+			// A. We were observing too much reduction in the
+			//    compensated-score-ratio for L0, so by choosing a
+			//    denominator that was smaller (baseline-score(Lbase) <=
+			//    compensated-score(Lbase)), we don't reduce L0 score by as
+			//    much.
+			// B. The ratio logic is trying to compensate for the next level
+			//    being large, resulting in higher write-amp, so we can
+			//    justify use the actual size of that level.
+			//
+			// TODO(irfansharif): If two consecutive levels have high
+			// compensated scores (lots of tombstones present) relative to
+			// the database size (clearrange roachtest exemplifies this),
+			// the division results in a high compensated score ratio and we
+			// end up prioritizing such compactions over L0.
+			divisor := scores[level].rawScore
 			if divisor < minScore {
 				divisor = minScore
 			}
